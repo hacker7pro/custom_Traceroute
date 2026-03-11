@@ -1,409 +1,428 @@
 #!/usr/bin/env python3
 """
-ICMP Traceroute Crafter – with full IP fragmentation control + custom IP options + IP checksum control
+ICMP Traceroute Crafter v2
+– crafter-style prompts (hex/bin/dec) for every field
+– exact send options (count, interval, timeout)
+– full IP fragmentation + custom IP options
+– manual IP checksum control (auto / custom / extra-bytes)
+– manual ICMP checksum control (auto / custom / extra-bytes)
+– padding support
+– raw hex mode
+– all 8 payload types
 """
+
+import random, string, time, sys
 import scapy.all as scapy
 from scapy.utils import checksum
 from scapy.all import IP, ICMP, Raw, IPOption
-import time
-import sys
-import random
-import string
+from scapy.layers.l2 import Ether
 
-MIN_PAYLOAD_DYNAMIC = 48
-MAX_PAYLOAD = 2000
-PAYLOAD_GROW_PER_HOP = 44
+# ── constants ─────────────────────────────────────────────────────────────────
+MIN_PAYLOAD_DYNAMIC   = 48
+MAX_PAYLOAD           = 2000
+PAYLOAD_GROW_PER_HOP  = 44
 
-def get_default_src_ip():
+# ── helpers (crafter-style) ───────────────────────────────────────────────────
+
+def src_ip():
+    try:    return scapy.get_if_addr(scapy.conf.iface)
+    except: return "127.0.0.1"
+
+def prompt(name, bits, def_hex, def_bin, def_dec, lo=None, hi=None, note=None):
+    lo_s = f" (min h={hex(lo)[2:].zfill(bits//4)} d={lo})" if lo is not None else ""
+    hi_s = f" (max h={hex(hi)[2:].zfill(bits//4)} d={hi})" if hi is not None else ""
+    nt_s = f" ({note})" if note else ""
+    return input(
+        f"{name} ({bits}b) [h={def_hex}|b={def_bin}|d={def_dec}]{lo_s}{hi_s}{nt_s}\n→ "
+    ).strip()
+
+def parse_num(s, default, name, lo=None, hi=None):
+    if not s: return default
+    s = s.strip().replace(" ", "").lower()
+    for base in (10, 16, 2):
+        try:
+            v = (int(s.replace("0x",""), 16)
+                 if base == 16 else int(s, base))
+            if (lo is not None and v < lo) or (hi is not None and v > hi):
+                print(f"  Note: {name}={v} outside range → using anyway")
+            return v
+        except ValueError:
+            pass
+    print(f"  Invalid {name} → using {default}"); return default
+
+def hex_to_bytes(s):
+    clean = s.replace(" ","").replace("0x","")
+    if not clean or not all(c in "0123456789abcdefABCDEF" for c in clean):
+        return None
+    try:    return bytes.fromhex(clean)
+    except: return None
+
+# ── IP checksum (manual) ──────────────────────────────────────────────────────
+
+def ip_chksum_calc(ver, ihl, tos, tlen, id_, ff, ttl, proto, src, dst, opts=b''):
+    h = bytearray()
+    h += bytes([(ver<<4)|ihl, tos])
+    h += tlen.to_bytes(2,'big') + id_.to_bytes(2,'big') + ff.to_bytes(2,'big')
+    h += bytes([ttl, proto, 0, 0]) + src + dst + opts
+    s = 0
+    for i in range(0, len(h), 2):
+        w = (h[i]<<8) + (h[i+1] if i+1<len(h) else 0)
+        s = (s+w & 0xffff) + ((s+w) >> 16)
+    return ~s & 0xffff
+
+def build_ip_hdr(ver, ihl, tos, tlen, id_, ff, ttl, proto, src, dst, opts, ck):
+    h = bytearray([(ver<<4)|ihl, tos])
+    h += tlen.to_bytes(2,'big') + id_.to_bytes(2,'big') + ff.to_bytes(2,'big')
+    h += bytes([ttl, proto, (ck>>8)&0xff, ck&0xff])
+    h += src + dst + opts
+    return bytes(h)
+
+def resolve_mac(dst, src):
+    lmac = scapy.get_if_hwaddr(scapy.conf.iface)
+    _, _, nh = scapy.conf.route.route(dst)
+    ip = dst if nh in ("0.0.0.0", src) else nh
+    print(f"  Resolving MAC for {ip} ...")
     try:
-        return scapy.get_if_addr(scapy.conf.iface)
-    except:
-        return "127.0.0.1"
+        mac = scapy.getmacbyip(ip)
+        if mac: print(f"  MAC: {mac}"); return lmac, mac
+    except Exception as e: print(f"  MAC error: {e}")
+    print("  → fallback broadcast"); return lmac, "ff:ff:ff:ff:ff:ff"
 
-def prompt_field(name, bits, def_val):
-    max_val = (1 << bits) - 1
-    min_val = 0
+def send_frame(ip_bytes, lmac, rmac, timeout):
+    pkt = Ether(src=lmac, dst=rmac, type=0x0800) / Raw(load=ip_bytes)
+    return scapy.srp(pkt, timeout=timeout, verbose=0, iface=scapy.conf.iface)
 
-    def_hex = f"{def_val:X}".upper()
-    def_bin = f"{def_val:0{bits}b}"
-    def_dec = str(def_val)
-
-    min_hex = f"{min_val:X}".upper()
-    min_bin = f"{min_val:0{bits}b}"
-    min_dec = str(min_val)
-
-    max_hex = f"{max_val:X}".upper()
-    max_bin = f"{max_val:0{bits}b}"
-    max_dec = str(max_val)
-
-    range_info = f" (min hex={min_hex}, bin={min_bin}, dec={min_dec}) (max hex={max_hex}, bin={max_bin}, dec={max_dec})"
-    default_info = f"[default: hex={def_hex} | bin={def_bin} | dec={def_dec}]"
-
-    msg = f"{name} ({bits} bits) {default_info}{range_info}\n→ "
-    return input(msg).strip()
-
-def parse_any_numeric(s, bits, default, field_name):
-    if not s:
-        return default
-    s = s.replace(" ", "").lower()
-    max_val = (1 << bits) - 1
-    try:
-        val = int(s)
-        if 0 <= val <= max_val: return val
-    except: pass
-    try:
-        if s.startswith("0x"): val = int(s[2:], 16)
-        elif s.endswith("h"): val = int(s[:-1], 16)
-        elif all(c in "0123456789abcdef" for c in s): val = int(s, 16)
-        else: raise ValueError
-        if 0 <= val <= max_val: return val
-    except: pass
-    try:
-        if s.startswith("0b"): val = int(s[2:], 2)
-        elif s.startswith("b"): val = int(s[1:], 2)
-        elif all(c in "01" for c in s): val = int(s, 2)
-        else: raise ValueError
-        if 0 <= val <= max_val: return val
-    except: pass
-    print(f"Invalid {field_name} (0–{max_val}). Using default {default}.")
-    return default
-
-def print_icmp_reference():
-    print("\nCommon ICMP:")
-    print(" 8/0 → Echo Request")
-    print("11/0 → Time Exceeded")
-    print(" 3/* → Destination Unreachable\n")
-
-def generate_payload(length, ptype_num, pattern_arg=None):
-    if length <= 0: return b''
-    if ptype_num == 1: return bytes(random.randint(0, 1) for _ in range(length))
-    if ptype_num == 2: return bytes(random.randint(0, 255) for _ in range(length))
-    if ptype_num == 3:
-        b = pattern_arg if isinstance(pattern_arg, int) else random.randint(0, 255)
-        return bytes([b]) * length
-    if ptype_num == 4:
-        payload = bytearray()
-        val = random.randint(0, 255)
-        for _ in range(length):
-            payload.append(val % 256)
-            op = random.choice(['+1','+3','*2','//2','nop'])
-            if op == '+1': val += 1
-            elif op == '+3': val += 3
-            elif op == '*2': val = (val * 2) & 0xFFFF
-            elif op == '//2' and val: val //= 2
-        return bytes(payload)
-    if ptype_num == 5:
-        pool = (string.ascii_letters + string.digits + string.punctuation).encode()
-        return bytes(random.choice(pool) for _ in range(length))
-    if ptype_num == 6:
-        opt1 = bytes(random.randint(0, 1) for _ in range(length))
-        bit_str = ''.join(f'{b:08b}' for b in opt1)
-        if random.random() < 0.3:
-            pos = random.randint(0, len(bit_str) - 80)
-            flip = random.choice(['0','1'])
-            run = random.randint(16, 64)
-            bit_str = bit_str[:pos] + flip * run + bit_str[pos+run:]
-        payload = bytearray()
-        for i in range(0, len(bit_str), 8):
-            chunk = bit_str[i:i+8].ljust(8, '0')
-            payload.append(int(chunk, 2))
-        return bytes(payload)
-    if ptype_num == 7:
-        pairs = [(0x55,0xAA),(0xA5,0x5A),(0xFF,0x00),(0xF0,0x0F),
-                 (0xCC,0x33),(0xAA,0x55),(0x5A,0xA5),(0x00,0xFF)]
-        p = random.choice(pairs)
-        payload = bytearray()
-        for j in range(length):
-            payload.append(p[j % 2])
-        return bytes(payload)
-    return b''
+# ── padding / send-params ─────────────────────────────────────────────────────
 
 def ask_padding():
-    ans = input("\nAdd padding IP→ICMP? (y/n) [default n]: ").strip().lower()
-    if ans not in ['y','yes']: return None
-    try: cnt = max(1, min(80, int(input("Count (default 4): ") or 4)))
-    except: cnt = 4
-    val = input("Byte hex (default 00): ").strip() or "00"
-    try: b = int(val, 16) & 0xFF
-    except: b = 0
-    print(f" → {cnt} × 0x{b:02x}")
-    return bytes([b]) * cnt
-
-def parse_hex_bytes(prompt_text):
-    print(prompt_text)
-    hex_input = input("→ ").strip()
-    try:
-        hex_clean = hex_input.replace(" ", "").lower()
-        bytes_data = bytes.fromhex(hex_clean)
-        print(f" → Parsed {len(bytes_data)} bytes from hex")
-        return bytes_data
-    except ValueError:
-        print("Invalid hex → using no options / empty payload fallback")
+    if input("\nAdd padding? (y/n) [n]: ").strip().lower() not in ('y','yes'):
         return b''
+    cnt = max(1, min(100, int(input("Count [4]: ").strip() or 4)))
+    b   = int((input("Byte hex [00]: ").strip() or "00"), 16) & 0xFF
+    print(f"  → {cnt}×0x{b:02x}"); return bytes([b])*cnt
+
+def ask_send_params():
+    count    = int(input("\nProbes per hop [3]: ").strip() or 3)
+    interval = float(input("Interval s [0.6]: ").strip() or 0.6)
+    timeout  = float(input("Timeout s [2.0]: ").strip() or 2.0)
+    max_hops = int(input("Max hops [30]: ").strip() or 30)
+    return count, interval, timeout, max_hops
+
+# ── payload generator ─────────────────────────────────────────────────────────
+
+def gen_payload(n, ptype, pat=None):
+    if n <= 0: return b''
+    if ptype == 1: return bytes(random.randint(0,1) for _ in range(n))
+    if ptype == 2: return bytes(random.randint(0,255) for _ in range(n))
+    if ptype == 3:
+        b = pat if isinstance(pat,int) else random.randint(0,255)
+        print(f"  → repeat 0x{b:02x}"); return bytes([b])*n
+    if ptype == 4:
+        buf, v = bytearray(), 0
+        for _ in range(n):
+            buf.append(v%256)
+            op = random.choice(['+2','*2','/2','nop'])
+            if op=='+2': v+=2
+            elif op=='*2': v*=2
+            elif op=='/2' and v: v//=2
+        return bytes(buf)
+    if ptype == 5:
+        pool = (string.ascii_letters+string.digits+string.punctuation).encode()
+        return bytes(random.choice(pool) for _ in range(n))
+    if ptype == 6:
+        bs = ''.join(random.choice('01') for _ in range(n*8))
+        for _ in range(random.randint(2,6)):
+            p=random.randint(0,n*8-100); rl=random.randint(16,80)
+            bs=bs[:p]+random.choice('01')*rl+bs[p+rl:]
+        bs=bs[:n*8]
+        buf=bytearray(int(bs[j:j+8].ljust(8,'0'),2) for j in range(0,len(bs),8))
+        print("  → bit stream"); return bytes(buf)
+    if ptype == 7:
+        p = random.choice([(0x55,0xAA),(0xA5,0x5A),(0xFF,0x00),(0xF0,0x0F),(0xCC,0x33),(0xAB,0xCD)])
+        print(f"  → hex-pair {p[0]:02X}{p[1]:02X}")
+        return bytes(p[j%2] for j in range(n))
+    if ptype == 8:
+        b = hex_to_bytes(input("Custom hex: ").strip())
+        if not b: print("  → invalid → random"); return bytes(random.randint(0,255) for _ in range(n))
+        b = b[:n] if len(b)>=n else (b*((n+len(b)-1)//len(b)))[:n]
+        print(f"  → custom {len(b)}B"); return b
+    return b''
+
+# ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    print("=== ICMP Traceroute Crafter – full fragmentation control + custom IP options ===\n")
+    print("=== ICMP Traceroute Crafter v2 ===")
+    print("  Bit/Byte/Hex ref: 4b=<1B  8b=1B=2hex  16b=2B=4hex  32b=4B=8hex")
+    print("─" * 60)
 
-    print("IP Layer:")
-    version = parse_any_numeric(prompt_field("Version", 4, 4), 4, 4, "Version")
-    ihl = parse_any_numeric(prompt_field("IHL", 4, 5), 4, 5, "IHL")
-    print(f" → Header length will be {ihl * 4} bytes (IHL={ihl})")
-    dscp = parse_any_numeric(prompt_field("DSCP", 6, 0), 6, 0, "DSCP")
-    ecn = parse_any_numeric(prompt_field("ECN", 2, 0), 2, 0, "ECN")
+    # ── IP Header ──────────────────────────────────────────────
+    print("\n── IP Header ──")
+    version = parse_num(prompt("Version",4,"4","0100","4",lo=4,hi=4),             4,"Version")
+    ihl     = parse_num(prompt("IHL",4,"5","0101","5",note="5=20B 6=24B 7=28B"),  5,"IHL")
+    dscp    = parse_num(prompt("DSCP",6,"00","000000","0",lo=0,hi=63),             0,"DSCP")
+    ecn     = parse_num(prompt("ECN",2,"00","00","0",lo=0,hi=3),                   0,"ECN")
+    proto   = parse_num(prompt("Proto",8,"01","00000001","1",lo=0,hi=255,note="1B"),1,"Proto")
+    ip_id_base = parse_num(prompt("IP ID base",16,"0000","0"*16,"0",lo=0,hi=65535,note="2B"),0,"ID")
+    src     = input(f"Src IP [{src_ip()}]: ").strip() or src_ip()
+    dst     = input("Dst IP [8.8.8.8]: ").strip() or "8.8.8.8"
+    SRC, DST = scapy.inet_aton(src), scapy.inet_aton(dst)
+    tos     = (dscp<<2)|ecn
 
-    ip_options = b''
-    add_options = input("\nAdd custom IP Options? (y/n) [default n]: ").strip().lower()
-    if add_options in ['y', 'yes']:
-        print("Enter IP options as hex (spaces allowed, e.g. '01 03 0a bb')")
-        print("→ Min: 0 bytes (no options)   Max: usually 40 bytes (IHL≤15 → total header ≤60 B)")
-        ip_options = parse_hex_bytes("Custom IP options hex")
-        if ip_options:
-            print(f" → Using {len(ip_options)} bytes of custom options")
+    # TTL start (per-hop increment)
+    ttl_start = parse_num(prompt("Starting TTL",8,"01","00000001","1",lo=1,hi=255,note="increments per hop"),1,"TTL start")
 
-    print("\nIP Fragmentation control:")
-    reserved_input = input("Reserved bit (evil bit / bit 0) – set to 1? (y/n) [default n]: ").strip().lower()
-    reserved = 1 if reserved_input in ['y','yes','1','true'] else 0
-    df_input = input("Don't Fragment (DF) bit – set to 1? (y/n) [default n]: ").strip().lower()
-    df = 1 if df_input in ['y','yes','1','true'] else 0
-    mf_input = input("More Fragments (MF) bit – set to 1? (y/n) [default n]: ").strip().lower()
-    mf = 1 if mf_input in ['y','yes','1','true'] else 0
-    offset_str = input("Fragment Offset (in 8-byte units) [default 0]: ").strip() or "0"
-    frag_offset = parse_any_numeric(offset_str, 13, 0, "Fragment Offset")
+    # ── IP Fragmentation ───────────────────────────────────────
+    print("\n── IP Fragmentation ──")
+    reserved = 1 if input("Reserved (evil) bit = 1? (y/n) [n]: ").strip().lower() in ('y','yes') else 0
+    df       = 1 if input("DF bit = 1? (y/n) [n]: ").strip().lower() in ('y','yes') else 0
+    mf       = 1 if input("MF bit = 1? (y/n) [n]: ").strip().lower() in ('y','yes') else 0
+    frag_offset = parse_num(
+        input("Fragment offset (8-byte units) [0]: ").strip() or "0",
+        0, "FragOffset", lo=0, hi=65520)
     frag_offset = (frag_offset // 8) * 8
-    if frag_offset > 65520:
-        print("Warning: Fragment offset too large → clamped to 65520")
-        frag_offset = 65520
+    ff = ((reserved<<2)|(df<<1)|mf) << 13 | (frag_offset // 8)
 
-    ttl_start = parse_any_numeric(prompt_field("Starting TTL", 8, 64), 8, 64, "TTL")
-    proto = parse_any_numeric(prompt_field("Proto", 8, 1), 8, 1, "Proto")
-    ip_id_base = parse_any_numeric(prompt_field("IP ID base", 16, 0), 16, 0, "ID")
-    src = input(f"Source IP [default {get_default_src_ip()}]: ").strip() or get_default_src_ip()
-    dst = input("Destination IP [default 8.8.8.8]: ").strip() or "8.8.8.8"
-
-    # ────────────────────────────────────────────────
-    # Desired ICMP checksum
-    # ────────────────────────────────────────────────
-    chksum_str = input("\nDesired ICMP checksum hex (empty = auto): ").strip()
-    use_custom = bool(chksum_str)
-    desired = None
-    prefer_odd = True
-
-    if use_custom:
-        try:
-            desired = int(chksum_str.replace("0x",""), 16) & 0xFFFF
-            print(f" → Custom ICMP checksum: {hex(desired)}")
-            parity = input("Preferred parity when adjusting (odd/even) [default odd]: ").strip().lower()
-            prefer_odd = not parity.startswith('e')
-        except:
-            print("Invalid checksum → auto mode")
-            use_custom = False
-
-    # ────────────────────────────────────────────────
-    # IP checksum adjustment – new two-step prompt style
-    # ────────────────────────────────────────────────
-    ip_chksum_mode = "auto"
-    ip_chksum_extra = 0
-
-    if not use_custom:
-        mode_choice = input("\nIP checksum calculation: default or default + extra bytes? (default/extra): ").strip().lower()
-        if mode_choice in ["extra", "e"]:
+    # ── IP Options ─────────────────────────────────────────────
+    ip_opts = b''
+    if input("\nAdd IP options? (y/n) [n]: ").strip().lower() in ('y','yes'):
+        h = input("Options hex (mult of 4B, max 40B=80 hex chars): ").strip().replace(" ","").replace("0x","").upper()
+        if h and all(c in "0123456789ABCDEF" for c in h) and len(h)//2 <= 40:
             try:
-                extra_str = input("Extra bytes for IP checksum calculation (0-100): ").strip()
-                extra_val = int(extra_str)
-                if 0 <= extra_val <= 100:
-                    ip_chksum_extra = extra_val
-                    ip_chksum_mode = "extra"
-                    print(f"  → IP checksum calculation: default + {extra_val} extra bytes")
+                ip_opts = bytes.fromhex(h)
+                pad = (4 - len(ip_opts)%4)%4
+                if pad: ip_opts += b'\x00'*pad; print(f"  → padded: {ip_opts.hex().upper()}")
+                else:   print(f"  → accepted: {h}")
+                ihl = 5 + len(ip_opts)//4
+                print(f"  → IHL={ihl} ({ihl*4}B)")
+            except Exception as e: print(f"  → error: {e}")
+        else: print("  → invalid/too long → no options")
+
+    # ── IP Checksum ────────────────────────────────────────────
+    print("\n── IP Checksum ──")
+    print("  1. Auto (correct)   2. Custom value   3. Auto + extra bytes")
+    ip_ck_mode = (input("→ [1]: ").strip() or "1")
+    ip_ck_custom_val  = None
+    ip_ck_extra_bytes = 0
+
+    if ip_ck_mode == "2":
+        cs = input("Desired IP checksum hex [0x0000]: ").strip()
+        try:
+            ip_ck_custom_val = int(cs.replace("0x",""),16) & 0xFFFF
+            print(f"  → custom 0x{ip_ck_custom_val:04x}")
+        except: print("  → invalid → auto")
+    elif ip_ck_mode == "3":
+        try:
+            ip_ck_extra_bytes = max(0, min(100, int(input("Extra bytes [0]: ").strip() or 0)))
+            print(f"  → auto + {ip_ck_extra_bytes}B extra")
+        except: pass
+
+    def get_ip_ck(tlen, cur_id, ttl_val):
+        if ip_ck_custom_val is not None:
+            return ip_ck_custom_val
+        # auto  = standard 20B header only (no opts)
+        # extra = standard 20B header + extra null bytes appended into calc
+        opts_for_ck = b'\x00' * ip_ck_extra_bytes
+        return ip_chksum_calc(version, ihl, tos, tlen, cur_id, ff, ttl_val, proto, SRC, DST, opts_for_ck)
+
+    # ── Protocol ───────────────────────────────────────────────
+    print("\n── Protocol / Body ──\n  1. ICMP   2. Raw hex")
+    use_raw = (input("→ [1]: ").strip() or "1") == "2"
+
+    # ── RAW MODE ───────────────────────────────────────────────
+    if use_raw:
+        print("\nAny case accepted (deadBEEF / DEADBEEF / deadbeef)")
+        raw_bytes = hex_to_bytes(input("Raw hex → ").strip())
+        if raw_bytes is None:
+            print("  → invalid → empty"); raw_bytes = b''
+
+        padding = ask_padding()
+        probes_per_hop, interval, timeout, max_hops = ask_send_params()
+
+        print(f"\nTraceroute to {dst}, max {max_hops} hops, {probes_per_hop} probe(s)/hop\n")
+        lmac, rmac = resolve_mac(dst, src)
+        body = raw_bytes + padding
+
+        reached_dst = False
+        for hop in range(1, max_hops + 1):
+            ttl  = ttl_start + hop - 1
+            print(f"Hop {hop:2d} ", end="", flush=True)
+            for probe in range(1, probes_per_hop + 1):
+                cur_id = (ip_id_base + (hop-1)*probes_per_hop + probe - 1) % 65536
+                tlen   = ihl*4 + len(body)
+                ck     = get_ip_ck(tlen, cur_id, ttl)
+                hdr    = build_ip_hdr(version, ihl, tos, tlen, cur_id, ff, ttl, proto, SRC, DST, ip_opts, ck)
+                ans, _ = send_frame(hdr + body, lmac, rmac, timeout)
+                if ans:
+                    r   = ans[0][1]
+                    rtt = (r.time - ans[0][0].sent_time) * 1000
+                    rip = r[IP].src if IP in r else "?"
+                    print(f"{rip} {rtt:.1f}ms ", end="", flush=True)
+                    if IP in r and r[IP].src == dst:
+                        reached_dst = True
                 else:
-                    print("Value out of range → using default (no adjustment)")
-            except:
-                print("Invalid number → using default (no adjustment)")
-        else:
-            print("  → Using default IP checksum (no adjustment)")
-    # ────────────────────────────────────────────────
+                    print("* ", end="", flush=True)
+                time.sleep(interval)
+            print()
+            if reached_dst: break
 
-    print("\nICMP Layer:")
-    print_icmp_reference()
-    itype = parse_any_numeric(prompt_field("Type", 8, 8), 8, 8, "Type")
-    icode = parse_any_numeric(prompt_field("Code", 8, 0), 8, 0, "Code")
-    iid = parse_any_numeric(prompt_field("Identifier", 16, 1), 16, 1, "ID")
-    seqb = parse_any_numeric(prompt_field("Seq base", 16, 1), 16, 1, "Seq")
+        if not reached_dst: print("\n→ Destination not reached.")
+        print("\nDone."); return
 
-    print("\nPayload type (1–8):")
-    print("1. random 0/1 bytes     2. full random      3. repeating byte")
-    print("4. arithmetic seq       5. mixed chars      6. bit stream")
-    print("7. repeating hex pair   8. custom hex payload")
+    # ── ICMP MODE ──────────────────────────────────────────────
+    print("\n── ICMP Layer ──")
+    print("  8/0=EchoReq  0/0=EchoRep  3/x=Unreach  11/0=TimeExc\n")
+    itype = parse_num(prompt("Type",8,"08","00001000","8",lo=0,hi=255,note="1B"), 8,"Type")
+    icode = parse_num(prompt("Code",8,"00","00000000","0",lo=0,hi=255,note="1B"), 0,"Code")
+    iid   = parse_num(prompt("ID",16,"0001","0"*15+"1","1",lo=0,hi=65535,note="2B"),1,"ID")
+    seqb  = parse_num(prompt("Seq base",16,"0001","0"*15+"1","1",lo=0,hi=65535,note="2B"),1,"Seq")
+
+    # ── ICMP Checksum ──────────────────────────────────────────
+    print("\n── ICMP Checksum ──")
+    print("  1. Auto (correct)   2. Custom value   3. Auto + extra bytes")
+    icmp_ck_mode = (input("→ [1]: ").strip() or "1")
+    icmp_ck_custom_val  = None
+    icmp_ck_extra_bytes = 0
+    prefer_odd          = True
+
+    if icmp_ck_mode == "2":
+        cs = input("Desired ICMP checksum hex [0x0000]: ").strip()
+        try:
+            icmp_ck_custom_val = int(cs.replace("0x",""),16) & 0xFFFF
+            print(f"  → custom 0x{icmp_ck_custom_val:04x}")
+            parity = input("Parity when adjusting (odd/even) [odd]: ").strip().lower()
+            prefer_odd = not parity.startswith('e')
+        except: print("  → invalid → auto")
+    elif icmp_ck_mode == "3":
+        try:
+            icmp_ck_extra_bytes = max(0, min(100, int(input("Extra bytes [0]: ").strip() or 0)))
+            print(f"  → auto + {icmp_ck_extra_bytes}B extra")
+        except: pass
+
+    # ── Payload ────────────────────────────────────────────────
+    print("\n── Payload ──")
+    print("  1=rand-bits 2=rand-hex 3=repeat 4=arith 5=mixed 6=bits 7=hex-pair 8=custom")
     try:
-        ptype = int(input("→ "))
-        if not 1 <= ptype <= 8: ptype = 5
-    except:
-        ptype = 5
-
-    pattern_byte = None
-    custom_hex_payload = None
-
+        ptype = int(input("→ [5]: ").strip() or 5); ptype = ptype if 1<=ptype<=8 else 5
+    except: ptype = 5
+    pat = None
     if ptype == 3:
-        p = input("Pattern byte hex (default AA): ").strip() or "AA"
-        try: pattern_byte = int(p, 16) & 0xFF
-        except: pattern_byte = 0xAA
-    elif ptype == 8:
-        print("\nEnter custom payload as hex (spaces or continuous, e.g. 'deadbeef' or 'de ad be ef')")
-        hex_input = input("→ ").strip()
-        try:
-            hex_clean = hex_input.replace(" ", "").lower()
-            custom_hex_payload = bytes.fromhex(hex_clean)
-            print(f" → Custom payload accepted, length = {len(custom_hex_payload)} bytes")
-        except ValueError:
-            print("Invalid hex string → falling back to default random payload (type 5)")
-            ptype = 5
+        try:    pat = int((input("Pattern byte [AA]: ").strip() or "AA"), 16) & 0xFF
+        except: pat = 0xAA
 
-    fixed_payload_len = None
-    if ptype == 8 and custom_hex_payload is not None:
-        print(" → Using exact length from custom hex payload")
-    elif use_custom:
-        print(f" → Dynamic size (start ~{MIN_PAYLOAD_DYNAMIC} B + growth + adjustment, max {MAX_PAYLOAD} B)")
-    else:
+    use_dynamic = False
+    fixed_payload_len = 420
+    if icmp_ck_custom_val is not None:
+        print(f"  → Dynamic size (start ~{MIN_PAYLOAD_DYNAMIC}B + {PAYLOAD_GROW_PER_HOP}B/hop, max {MAX_PAYLOAD}B) for checksum fitting")
+        use_dynamic = True
+    elif ptype != 8:
         try:
-            fixed_payload_len = int(input(f"\nFixed payload size (bytes) [default 420]: ") or 420)
-            fixed_payload_len = max(32, fixed_payload_len)
-            print(f" → Fixed size: {fixed_payload_len} bytes")
-        except:
-            fixed_payload_len = 420
-            print(" → Using default 420 bytes")
+            v = input(f"Fixed payload size B [420]: ").strip()
+            fixed_payload_len = max(8, int(v or 420))
+            print(f"  → {fixed_payload_len}B")
+        except: fixed_payload_len = 420
 
     padding = ask_padding()
-    max_hops = int(input("\nMax hops [default 30]: ") or 30)
-    probes_per_hop = int(input("Probes per hop [default 3]: ") or 3)
-    timeout = float(input("Timeout (s) [default 2.0]: ") or 2.0)
-    interval = float(input("Interval (s) [default 0.6]: ") or 0.6)
+    probes_per_hop, interval, timeout, max_hops = ask_send_params()
 
-    flags_bin = f"{reserved}{df}{mf}"
-    print(f"\nTracing {dst} max {max_hops} hops {probes_per_hop} probes/hop")
-    print(f"IP Flags: Reserved={reserved}, DF={df}, MF={mf} (binary: {flags_bin})")
-    print(f"Fragment Offset: {frag_offset} (0x{frag_offset:04x})")
-    if ip_options:
-        print(f"Custom IP options: {len(ip_options)} bytes")
-    print("")
+    flags_str = f"R={reserved} DF={df} MF={mf}"
+    print(f"\nTraceroute to {dst}, TTL start={ttl_start}, max {max_hops} hops, "
+          f"{probes_per_hop} probe(s)/hop")
+    print(f"IP Flags: {flags_str}  FragOffset={frag_offset}")
+    if ip_opts: print(f"IP Options: {len(ip_opts)}B {ip_opts.hex().upper()}")
+    print()
 
+    lmac, rmac = resolve_mac(dst, src)
     reached_dst = False
+
     for hop in range(1, max_hops + 1):
         ttl = ttl_start + hop - 1
-        print(f"Hop {hop:2d} ", end="", flush=True)
+        print(f"Hop {hop:2d} (TTL={ttl}) ", end="", flush=True)
+
         for probe in range(1, probes_per_hop + 1):
-            seq = (seqb + (hop-1)*probes_per_hop + probe - 1) % 65536
+            seq    = (seqb + (hop-1)*probes_per_hop + probe - 1) % 65536
+            cur_id = (ip_id_base + (hop-1)*probes_per_hop + probe - 1) % 65536
 
-            if ptype == 8 and custom_hex_payload is not None:
-                payload = custom_hex_payload
-                payload_len = len(payload)
-                display_size = payload_len
+            # build payload
+            if ptype == 8 or not use_dynamic:
+                payload = gen_payload(fixed_payload_len, ptype, pat)
             else:
-                payload_len = MIN_PAYLOAD_DYNAMIC + (hop - 1) * PAYLOAD_GROW_PER_HOP if use_custom else fixed_payload_len
-                payload_len = min(payload_len, MAX_PAYLOAD) if use_custom else payload_len
-                payload = generate_payload(payload_len, ptype, pattern_byte)
-                display_size = payload_len
+                pl_len  = min(MIN_PAYLOAD_DYNAMIC + (hop-1)*PAYLOAD_GROW_PER_HOP, MAX_PAYLOAD)
+                payload = gen_payload(pl_len, ptype, pat)
 
-            icmp_base = ICMP(type=itype, code=icode, id=iid, seq=seq, chksum=0)
-
-            cur_sum = checksum(bytes(icmp_base / payload))
+            # ICMP checksum
+            icmp_base_bytes = bytes(ICMP(type=itype, code=icode, id=iid, seq=seq, chksum=0))
             reason = ""
-            if use_custom and cur_sum != desired:
-                found = False
-                if len(payload) >= 2:
-                    last2 = int.from_bytes(payload[-2:], 'big')
-                    delta = (cur_sum - desired) % 65536
-                    new_last = (last2 - delta) % 65536
-                    payload = payload[:-2] + new_last.to_bytes(2, 'big')
-                    if checksum(bytes(icmp_base / payload)) == desired:
-                        found = True
-                        reason = "adj"
-                if not found:
-                    cl = len(payload)
-                    for d in range(2, 201, 2):
-                        for sign in [1, -1]:
-                            nl = cl + sign * d
-                            if nl < 40: continue
-                            if (nl % 2 == 1) == prefer_odd:
-                                payload = generate_payload(nl, ptype, pattern_byte)
-                                if checksum(bytes(icmp_base / payload)) == desired:
-                                    found = True
-                                    display_size = nl
-                                    reason = f"adj:{nl}"
-                                    break
-                        if found: break
 
-            icmp = icmp_base / payload
-            icmp.chksum = desired if use_custom else None
+            if icmp_ck_custom_val is not None:
+                desired = icmp_ck_custom_val
+                cur_sum = checksum(icmp_base_bytes + payload)
+                if cur_sum != desired:
+                    # try tail-word adjustment first
+                    if len(payload) >= 2:
+                        delta   = (cur_sum - desired) % 65536
+                        last2   = int.from_bytes(payload[-2:], 'big')
+                        new_l2  = (last2 - delta) % 65536
+                        p2      = payload[:-2] + new_l2.to_bytes(2,'big')
+                        if checksum(icmp_base_bytes + p2) == desired:
+                            payload = p2; reason = "adj"
+                    # length-sweep
+                    if reason != "adj":
+                        cl = len(payload)
+                        found = False
+                        for d in range(2, 201, 2):
+                            for sign in [1, -1]:
+                                nl = cl + sign*d
+                                if nl < 40: continue
+                                if (nl%2==1) == prefer_odd:
+                                    p2 = gen_payload(nl, ptype, pat)
+                                    if checksum(icmp_base_bytes + p2) == desired:
+                                        payload = p2; reason = f"adj:{nl}"; found = True; break
+                            if found: break
+                fck = desired
+            else:
+                # extra-bytes: compute checksum over payload + extra null bytes,
+                # but only the normal payload is actually sent in the packet
+                fck = checksum(icmp_base_bytes + payload + b'\x00' * icmp_ck_extra_bytes)
 
-            flags = (reserved << 2) | (df << 1) | mf
-            tos = (dscp << 2) | ecn
+            # ICMP bytes — packet contains only real payload (no extra bytes sent)
+            ih = icmp_base_bytes
+            icmp_bytes = ih[:2] + fck.to_bytes(2,'big') + ih[4:] + payload + padding
 
-            ip = IP(
-                version=version,
-                ihl=ihl,
-                tos=tos,
-                flags=flags,
-                frag=frag_offset // 8,
-                ttl=ttl,
-                proto=proto,
-                src=src,
-                dst=dst,
-                id=(ip_id_base + seq) % 65536,
-                options=IPOption(ip_options) if ip_options else []
-            )
+            # IP header
+            tlen   = ihl*4 + len(icmp_bytes)
+            ip_ck  = get_ip_ck(tlen, cur_id, ttl)
+            hdr    = build_ip_hdr(version, ihl, tos, tlen, cur_id, ff, ttl, proto, SRC, DST, ip_opts, ip_ck)
 
-            pkt = ip
-            if padding: pkt /= Raw(padding)
-            pkt /= icmp
-
-            # Apply IP checksum adjustment when requested
-            if not use_custom and ip_chksum_mode == "extra" and ip_chksum_extra > 0:
-                del ip.chksum               # force recompute
-                correct_chksum = ip.chksum
-                new_chksum = (correct_chksum + ip_chksum_extra) & 0xFFFF
-                ip.chksum = new_chksum
-                reason += f" (IP chksum +{ip_chksum_extra})"
-
-            try:
-                ans, _ = scapy.sr(pkt, timeout=timeout, verbose=0)
-            except Exception as e:
-                print(f"Send error: {e}")
-                continue
+            ans, _ = send_frame(hdr + icmp_bytes, lmac, rmac, timeout)
 
             if ans:
-                r = ans[0][1]
-                rtt_ms = (r.time - ans[0][0].sent_time) * 1000
-                who = r.src
-                chksum_ok = r.haslayer(ICMP) and checksum(bytes(r[ICMP])) == 0
-                payload_match = False
-                recv_len = 0
-                if r.haslayer(ICMP) and r[ICMP].haslayer(Raw):
-                    recv_pl = bytes(r[ICMP].payload)
-                    recv_len = len(recv_pl)
-                    sent_pl = bytes(pkt[ICMP].payload)
-                    payload_match = (sent_pl == recv_pl)
-                print(f"{who} {rtt_ms:5.1f}ms", end="")
-                print(f" {'✓' if chksum_ok else '✗'}chks", end="")
-                if reason:
-                    print(f" {reason}", end="")
-                print(f" {'✓' if payload_match else f'{recv_len}/{display_size}'}", end="")
-                if itype == 8 and r.haslayer(ICMP) and r[ICMP].type == 0:
-                    print(" ←dst", end="")
-                    reached_dst = True
+                r   = ans[0][1]
+                rtt = (r.time - ans[0][0].sent_time) * 1000
+                rip = r[IP].src if IP in r else "?"
+                print(f"{rip} {rtt:.1f}ms", end="")
+                if ICMP in r:
+                    ck_ok = checksum(bytes(r[ICMP])) == 0
+                    print(f" {'✓' if ck_ok else '✗'}chks", end="")
+                    if r[ICMP].type == 0 and itype == 8:
+                        recv_pl = bytes(r[ICMP].payload)
+                        match   = recv_pl == payload
+                        print(f" {'✓' if match else f'pl?{len(recv_pl)}/{len(payload)}'}", end="")
+                        print(" ←dst", end="")
+                        reached_dst = True
+                if reason: print(f" [{reason}]", end="")
+                print(f"  IPck=0x{ip_ck:04x} ICMPck=0x{fck:04x} ID=0x{cur_id:04x}", end="")
             else:
                 print("*", end="")
-            print(" ", end="", flush=True)
+            print("  ", end="", flush=True)
             time.sleep(interval)
+
         print()
-        if reached_dst:
-            break
-    if not reached_dst:
-        print("\n→ Destination not reached.")
+        if reached_dst: break
+
+    if not reached_dst: print("\n→ Destination not reached.")
     print("\nDone.")
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\nStopped.")
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
+    try:    main()
+    except KeyboardInterrupt: print("\nStopped.")
+    except Exception as e:    print(f"Error: {e}", file=sys.stderr)
