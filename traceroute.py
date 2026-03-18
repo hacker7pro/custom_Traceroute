@@ -16,7 +16,7 @@
 import random, string, time, sys
 import scapy.all as scapy
 from scapy.utils import checksum
-from scapy.layers.inet import IP, ICMP, Raw
+from scapy.all import IP, ICMP, Raw
 from scapy.layers.l2 import Ether
 
 MIN_PAYLOAD_DYNAMIC  = 48
